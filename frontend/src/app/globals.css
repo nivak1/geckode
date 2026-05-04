@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 8%;
+    --foreground: 240 10% 95%;
+
+    --card: 240 10% 11%;
+    --card-foreground: 240 10% 95%;
+
+    --popover: 240 10% 11%;
+    --popover-foreground: 240 10% 95%;
+
+    --primary: 22 92% 53%;
+    --primary-foreground: 240 10% 8%;
+
+    --secondary: 240 6% 18%;
+    --secondary-foreground: 240 10% 95%;
+
+    --muted: 240 6% 16%;
+    --muted-foreground: 240 5% 65%;
+
+    --accent: 240 6% 18%;
+    --accent-foreground: 240 10% 95%;
+
+    --destructive: 0 70% 55%;
+    --destructive-foreground: 240 10% 98%;
+
+    --border: 240 6% 20%;
+    --input: 240 6% 18%;
+    --ring: 22 92% 53%;
+
+    --radius: 0.65rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  body {
+    font-feature-settings: "ss01", "cv11";
+  }
+}
+
+.geckode-grid-bg {
+  background-image:
+    radial-gradient(
+      circle at 50% 0%,
+      hsl(22 92% 53% / 0.18),
+      transparent 60%
+    ),
+    linear-gradient(
+      to right,
+      hsl(240 6% 20% / 0.35) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      hsl(240 6% 20% / 0.35) 1px,
+      transparent 1px
+    );
+  background-size: 100% 100%, 36px 36px, 36px 36px;
+  background-position: 0 0, 0 0, 0 0;
+}

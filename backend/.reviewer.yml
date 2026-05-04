@@ -1,0 +1,9 @@
+language: python
+
+standards:
+  - PEP 8
+  - type hints on public functions
+  - no bare except clauses
+
+
+strictness: high
