@@ -80,6 +80,17 @@ def geckode_sync_login_allowlist() -> frozenset[str] | None:
         return None
     return frozenset(x.strip().lower() for x in raw.split(",") if x.strip())
 
+# When skipped-file summaries mention these path fragments, append a .gitignore hint.
+GITIGNORE_HINT_TRIGGER_SUBSTRINGS = (
+    "__pycache__/",
+    "node_modules/",
+    "vendor/",
+    "dist/",
+    "build/",
+    ".min.js",
+    ".min.css",
+)
+
 SKIP_FILE_PATTERNS = (
     "package-lock.json",
     "yarn.lock",

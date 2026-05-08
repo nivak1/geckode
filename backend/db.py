@@ -41,7 +41,7 @@ def _migrate_sqlite_connected_repo_columns() -> None:
 
 def init_db() -> None:
     # Imported here to register models with SQLModel metadata.
-    from models import ConnectedRepo, PRCommentSnapshot, User  # noqa: F401
+    from models import ConnectedRepo, PRCommentSnapshot, ReviewRun, User  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
     _migrate_sqlite_connected_repo_columns()

@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -39,7 +40,7 @@ from github_api import (
     get_github_user,
     list_user_repositories,
 )
-from models import ConnectedRepo, User
+from models import ConnectedRepo, ReviewRun, User
 from review_dimensions import dimensions_to_json, merge_dimensions, parse_dimensions_json
 from review_service import handle_review_error, run_review_for_comment_body
 from secrets_storage import decrypt_from_storage, encrypt_for_storage
@@ -531,10 +532,17 @@ def _bg_manual_review_job(
     pr_number: int,
     instructions: str | None,
     dimensions: dict[str, str] | None,
+    review_run_id: int,
 ) -> None:
     try:
         with session_scope() as session:
             from review_service import run_review
+
+            rr = session.get(ReviewRun, review_run_id)
+            if rr is not None:
+                rr.status = "running"
+                session.add(rr)
+                session.commit()
 
             run_review(
                 owner,
@@ -543,9 +551,48 @@ def _bg_manual_review_job(
                 extra_instructions=instructions,
                 session=session,
                 review_dimensions_override=dimensions,
+                review_run_id=review_run_id,
             )
     except Exception as e:  # noqa: BLE001
+        try:
+            with session_scope() as session:
+                rr = session.get(ReviewRun, review_run_id)
+                if rr is not None:
+                    rr.status = "failed"
+                    rr.finished_at = datetime.now(timezone.utc)
+                    rr.error_message = str(e)[:8000]
+                    session.add(rr)
+                    session.commit()
+        except Exception:
+            pass
         handle_review_error(owner, repo, pr_number, e)
+
+
+@app.get("/api/review-runs/{run_id}")
+def api_get_review_run(
+    run_id: int,
+    session: Session = Depends(get_session),
+    uid: int = Depends(current_user_id),
+):
+    rr = session.get(ReviewRun, run_id)
+    if rr is None or rr.user_id != uid:
+        raise HTTPException(status_code=404, detail="Review run not found")
+    return {
+        "id": rr.id,
+        "repo_full_name": rr.repo_full_name,
+        "pr_number": rr.pr_number,
+        "status": rr.status,
+        "created_at": rr.created_at.isoformat() if rr.created_at else None,
+        "finished_at": rr.finished_at.isoformat() if rr.finished_at else None,
+        "error_message": rr.error_message,
+        "inline_posted": rr.inline_posted,
+        "patched_count": rr.patched_count,
+        "resolved_threads": rr.resolved_threads,
+        "general_notes_count": rr.general_notes_count,
+        "skipped_files_count": rr.skipped_files_count,
+        "dropped_invalid_count": rr.dropped_invalid_count,
+        "used_fallback_comment": rr.used_fallback_comment,
+    }
 
 
 @app.post("/api/repos/{owner}/{repo}/pulls/{pr_number}/review")
@@ -577,10 +624,26 @@ def api_trigger_review(
         + (f" (with instructions)" if instructions else ""),
         flush=True,
     )
-    background_tasks.add_task(
-        _bg_manual_review_job, owner, repo, pr_number, instructions, dim_override
+    review_run = ReviewRun(
+        user_id=uid,
+        repo_full_name=full_name,
+        pr_number=pr_number,
+        status="queued",
     )
-    return {"ok": True, "pr_number": pr_number}
+    session.add(review_run)
+    session.commit()
+    session.refresh(review_run)
+    run_id = int(review_run.id)  # type: ignore[arg-type]
+    background_tasks.add_task(
+        _bg_manual_review_job,
+        owner,
+        repo,
+        pr_number,
+        instructions,
+        dim_override,
+        run_id,
+    )
+    return {"ok": True, "pr_number": pr_number, "run_id": run_id}
 
 
 # --- Static settings UI ---

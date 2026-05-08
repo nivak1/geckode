@@ -111,7 +111,7 @@ export const geckode = {
       dimensions?: Partial<ReviewDimensions>;
     },
   ) =>
-    request<{ ok: true; pr_number: number }>(
+    request<{ ok: true; pr_number: number; run_id: number }>(
       `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pr_number}/review`,
       {
         method: "POST",
@@ -121,4 +121,23 @@ export const geckode = {
         }),
       },
     ),
+  getReviewRun: (run_id: number) =>
+    request<ReviewRunPayload>(`/api/review-runs/${run_id}`),
+};
+
+export type ReviewRunPayload = {
+  id: number;
+  repo_full_name: string;
+  pr_number: number;
+  status: string;
+  created_at: string | null;
+  finished_at: string | null;
+  error_message: string | null;
+  inline_posted: number | null;
+  patched_count: number | null;
+  resolved_threads: number | null;
+  general_notes_count: number | null;
+  skipped_files_count: number | null;
+  dropped_invalid_count: number | null;
+  used_fallback_comment: boolean | null;
 };

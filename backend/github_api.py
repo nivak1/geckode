@@ -196,6 +196,47 @@ def post_pr_comment(
     return r.json()
 
 
+def list_issue_comments(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    *,
+    access_token: str | None = None,
+) -> list[dict[str, Any]]:
+    """PRs use the issues comments endpoint (issue number = PR number)."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    out: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        r = requests.get(
+            url,
+            headers=api_headers(access_token),
+            params={"per_page": 100, "page": page},
+            timeout=60,
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not isinstance(batch, list) or not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def delete_issue_comment(
+    owner: str,
+    repo: str,
+    comment_id: int,
+    *,
+    access_token: str | None = None,
+) -> None:
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/comments/{comment_id}"
+    r = requests.delete(url, headers=api_headers(access_token), timeout=30)
+    r.raise_for_status()
+
+
 def post_pr_review(
     owner: str,
     repo: str,
@@ -207,6 +248,20 @@ def post_pr_review(
     *,
     access_token: str | None = None,
 ) -> dict[str, Any]:
+    """POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews.
+
+    Prefer each inline comment as ``path`` + ``body`` + ``line`` + ``side`` (e.g.
+    RIGHT). Legacy ``position`` indexing often diverges from GitHub's diff and
+    triggers 422 ``Position could not be resolved``.
+
+    If 422 persists: confirm ``commit_id`` matches the PR diff you fetched, audit
+    ``diff_parser.build_position_map`` vs GitHub's unified diff, and check rename
+    / race between diff + head SHA calls. ``review_service.run_review`` falls
+    back to one aggregate PR comment when the review POST still fails.
+
+    Cursor prompt snippet: "Investigate 422 on POST …/pulls/…/reviews — validate
+    line/side anchors vs head SHA, diff fetch order, and diff line mapping."
+    """
     url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
     payload = {
         "commit_id": commit_id,

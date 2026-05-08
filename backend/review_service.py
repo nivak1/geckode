@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import time
 import traceback
+from datetime import datetime, timezone
+
 import requests
 from sqlmodel import Session, select
 
 from config import (
+    GITIGNORE_HINT_TRIGGER_SUBSTRINGS,
     MAX_DIFF_CHARS,
     MAX_TREE_APPENDIX_CHARS,
     PRIOR_COMMENT_SNIPPET_CHARS,
@@ -15,8 +18,13 @@ from config import (
     geckode_sync_login_allowlist,
 )
 from diff_parser import build_position_map, filter_diff
-from gemini import format_commits, review_pr
+from fallback_issue_comment import (
+    looks_like_geckode_fallback_aggregate,
+    parse_geckode_fallback_issue_body,
+)
+from gemini import classify_fallback_items_fixed, format_commits, review_pr
 from github_api import (
+    delete_issue_comment,
     get_authenticated_user_login,
     get_pr_commits,
     get_pr_diff,
@@ -24,6 +32,7 @@ from github_api import (
     get_pull_request_review_comment,
     get_recursive_tree_paths,
     get_repo_file,
+    list_issue_comments,
     list_pull_comments_for_review_merged,
     list_pull_request_review_comments_all,
     map_pull_comment_ids_to_thread_ids,
@@ -34,7 +43,7 @@ from github_api import (
     resolve_pull_request_review_thread,
 )
 from repo_tree import build_tree_appendix
-from models import PRCommentSnapshot, ConnectedRepo, standards_from_json
+from models import PRCommentSnapshot, ConnectedRepo, ReviewRun, standards_from_json
 from review_dimensions import (
     DEFAULT_REVIEW_DIMENSIONS,
     merge_dimensions,
@@ -178,6 +187,206 @@ def sync_geckode_snapshots_from_github(
     return changed
 
 
+def _skipped_paths_suggest_gitignore(skipped: list[str]) -> bool:
+    for s in skipped:
+        sl = s.lower()
+        for frag in GITIGNORE_HINT_TRIGGER_SUBSTRINGS:
+            if frag.lower() in sl:
+                return True
+    return False
+
+
+def _issue_comment_allowed_logins() -> frozenset[str]:
+    """Logins allowed to own Geckode issue comments (same policy as snapshot sync)."""
+    allow = geckode_sync_login_allowlist()
+    if allow is not None:
+        return allow
+    token_login = get_authenticated_user_login()
+    if not token_login:
+        return frozenset()
+    return frozenset({token_login.lower()})
+
+
+def delete_obsolete_fallback_issue_comments(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    *,
+    except_comment_id: int | None = None,
+) -> None:
+    """Remove Geckode 422 aggregate issue comments superseded by an inline review.
+
+    If ``except_comment_id`` is set (new fallback just posted), do not delete that id.
+    """
+    allowed = _issue_comment_allowed_logins()
+    if not allowed:
+        return
+    try:
+        comments = list_issue_comments(owner, repo, pr_number)
+    except Exception as e:
+        print(f"[cleanup] list issue comments: {e}", flush=True)
+        return
+    for c in comments:
+        cid = c.get("id")
+        if cid is None:
+            continue
+        icid = int(cid)
+        if except_comment_id is not None and icid == except_comment_id:
+            continue
+        user = ((c.get("user") or {}).get("login") or "").lower()
+        if user not in allowed:
+            continue
+        body = (c.get("body") or "").strip()
+        if not looks_like_geckode_fallback_aggregate(body):
+            continue
+        try:
+            delete_issue_comment(owner, repo, icid)
+            print(f"[cleanup] removed superseded fallback issue comment {icid}", flush=True)
+        except Exception as e:
+            print(f"[cleanup] delete issue comment {icid}: {e}", flush=True)
+
+
+def _omit_summary_issue_comment(
+    skipped: list[str],
+    dropped: list[str],
+    *,
+    patched_count: int,
+    resolved_threads: int,
+    general_notes: list[str] | None,
+) -> bool:
+    """Avoid posting another noisy summary when only generated paths were skipped."""
+    if patched_count or resolved_threads:
+        return False
+    if dropped:
+        return False
+    gn = [x for x in (general_notes or []) if str(x).strip()]
+    if gn:
+        return False
+    if not skipped:
+        return False
+    return True
+
+
+def _merge_inline_by_line(primary: list[dict], winner: list[dict]) -> list[dict]:
+    """Merge inline payloads by (path, line); entries in ``winner`` overwrite ``primary``."""
+    by_key: dict[tuple[str, int], dict] = {}
+    for c in primary:
+        by_key[(c["path"], c["line"])] = c
+    for c in winner:
+        by_key[(c["path"], c["line"])] = c
+    return list(by_key.values())
+
+
+def _reconcile_fallback_issue_comments(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    filtered_diff: str,
+    commits_text: str,
+    positions: dict[str, dict[int, int]],
+) -> list[dict]:
+    """Detect Geckode 422 aggregate issue comments; delete when appropriate; return unfixed inlines."""
+    allowed = _issue_comment_allowed_logins()
+    if not allowed:
+        return []
+
+    try:
+        comments = list_issue_comments(owner, repo, pr_number)
+    except Exception as e:
+        print(f"[reconcile] list issue comments: {e}", flush=True)
+        return []
+
+    for c in reversed(comments):
+        user = ((c.get("user") or {}).get("login") or "").lower()
+        if user not in allowed:
+            continue
+        raw_body = (c.get("body") or "").strip()
+        if not looks_like_geckode_fallback_aggregate(raw_body):
+            continue
+        cid = c.get("id")
+        if cid is None:
+            continue
+        items = parse_geckode_fallback_issue_body(raw_body)
+        if not items:
+            continue
+
+        fixed_flags = classify_fallback_items_fixed(
+            filtered_diff, items, commits_text=commits_text
+        )
+        if fixed_flags is None:
+            print("[reconcile] classify_fallback_items_fixed failed — try next comment", flush=True)
+            continue
+
+        if len(fixed_flags) != len(items):
+            print(
+                f"[reconcile] fixed length mismatch ({len(fixed_flags)} vs {len(items)}) — skip",
+                flush=True,
+            )
+            continue
+
+        n_fixed = sum(1 for x in fixed_flags if x)
+        n_total = len(items)
+        if n_fixed == 0:
+            print(
+                f"[reconcile] issue comment {cid}: 0/{n_total} fixed — keeping aggregate",
+                flush=True,
+            )
+            continue
+
+        payloads: list[dict] = []
+        if n_fixed < n_total:
+            for i, it in enumerate(items):
+                if fixed_flags[i]:
+                    continue
+                path = str(it.get("path") or "")
+                line_int = it.get("line")
+                body = (it.get("body") or "").strip()
+                if not path or not body:
+                    continue
+                if line_int is None:
+                    print(f"[reconcile] skip unfixed item without line: {path}", flush=True)
+                    continue
+                file_map = positions.get(path)
+                if not file_map or int(line_int) not in file_map:
+                    print(
+                        f"[reconcile] skip unfixed item not in current diff: {path}:{line_int}",
+                        flush=True,
+                    )
+                    continue
+                payloads.append(
+                    {"path": path, "line": int(line_int), "side": "RIGHT", "body": body}
+                )
+            if not payloads:
+                print(
+                    "[reconcile] partial fixes but no unfixed items anchor in diff — "
+                    "keeping aggregate",
+                    flush=True,
+                )
+                continue
+
+        try:
+            delete_issue_comment(owner, repo, int(cid))
+            print(f"[reconcile] deleted issue comment {cid}", flush=True)
+        except Exception as e:
+            print(f"[reconcile] delete issue comment {cid}: {e}", flush=True)
+            continue
+
+        if n_fixed == n_total:
+            print(
+                f"[reconcile] all {n_total} aggregate item(s) addressed — comment removed only",
+                flush=True,
+            )
+            return []
+
+        print(
+            f"[reconcile] reposting {len(payloads)} unfixed item(s) from aggregate ({n_fixed} fixed)",
+            flush=True,
+        )
+        return payloads
+
+    return []
+
+
 def _build_tree_appendix_block(owner: str, repo: str, head_sha: str) -> str:
     try:
         paths = get_recursive_tree_paths(owner, repo, head_sha)
@@ -248,6 +457,40 @@ def load_merged_repo_config(
     )
 
 
+def _finalize_review_run(
+    session: Session | None,
+    run_id: int | None,
+    *,
+    status: str,
+    error_message: str | None = None,
+    inline_posted: int | None = None,
+    patched_count: int | None = None,
+    resolved_threads: int | None = None,
+    general_notes_count: int | None = None,
+    skipped_files_count: int | None = None,
+    dropped_invalid_count: int | None = None,
+    used_fallback_comment: bool | None = None,
+) -> None:
+    """Persist dashboard review job outcome (manual runs only)."""
+    if session is None or run_id is None:
+        return
+    row = session.get(ReviewRun, run_id)
+    if row is None:
+        return
+    row.status = status
+    row.finished_at = datetime.now(timezone.utc)
+    row.error_message = error_message
+    row.inline_posted = inline_posted
+    row.patched_count = patched_count
+    row.resolved_threads = resolved_threads
+    row.general_notes_count = general_notes_count
+    row.skipped_files_count = skipped_files_count
+    row.dropped_invalid_count = dropped_invalid_count
+    row.used_fallback_comment = used_fallback_comment
+    session.add(row)
+    session.commit()
+
+
 def run_review_for_comment_body(
     owner: str,
     repo: str,
@@ -275,6 +518,7 @@ def run_review(
     extra_instructions: str | None = None,
     session: Session | None = None,
     review_dimensions_override: dict[str, str] | None = None,
+    review_run_id: int | None = None,
 ) -> None:
     commits = get_pr_commits(owner, repo, pr_number)
     raw_diff = get_pr_diff(owner, repo, pr_number)
@@ -282,6 +526,18 @@ def run_review(
 
     if not raw_diff.strip():
         post_pr_comment(owner, repo, pr_number, "🤖 The diff is empty — nothing to review.")
+        _finalize_review_run(
+            session,
+            review_run_id,
+            status="completed",
+            inline_posted=0,
+            patched_count=0,
+            resolved_threads=0,
+            general_notes_count=0,
+            skipped_files_count=0,
+            dropped_invalid_count=0,
+            used_fallback_comment=False,
+        )
         return
 
     yml_text = get_repo_file(owner, repo, ".reviewer.yml", ref=head_sha)
@@ -305,6 +561,18 @@ def run_review(
             pr_number,
             "🤖 Nothing to review — all changed files are generated/vendored or excluded.",
         )
+        _finalize_review_run(
+            session,
+            review_run_id,
+            status="completed",
+            skipped_files_count=len(skipped),
+            inline_posted=0,
+            patched_count=0,
+            resolved_threads=0,
+            general_notes_count=0,
+            dropped_invalid_count=0,
+            used_fallback_comment=False,
+        )
         return
 
     print(
@@ -322,10 +590,27 @@ def run_review(
             "🤖 Review skipped — all council dimensions are set to \"Don't check\". "
             "Enable Security, Performance, or Maintainability in repo settings or the review dialog.",
         )
+        _finalize_review_run(
+            session,
+            review_run_id,
+            status="completed",
+            skipped_files_count=len(skipped),
+            inline_posted=0,
+            patched_count=0,
+            resolved_threads=0,
+            general_notes_count=0,
+            dropped_invalid_count=0,
+            used_fallback_comment=False,
+        )
         return
 
     if session is not None:
         sync_geckode_snapshots_from_github(owner, repo, pr_number, session, full_name)
+
+    commits_text = format_commits(commits)
+    reconcile_prefix = _reconcile_fallback_issue_comments(
+        owner, repo, pr_number, filtered_diff, commits_text, positions
+    )
 
     print(f"[gemini] asking {len(filtered_diff)} chars...", flush=True)
     tree_block = _build_tree_appendix_block(owner, repo, head_sha)
@@ -333,7 +618,7 @@ def run_review(
         session, owner, repo, full_name, pr_number
     )
     llm = review_pr(
-        format_commits(commits),
+        commits_text,
         filtered_diff,
         repo_config,
         extra_instructions=_augment_extra_instructions(extra_instructions),
@@ -372,8 +657,7 @@ def run_review(
             dropped.append(f"{path}:{line_int} (file not in diff)")
             dropped_pairs.add((path, line_int))
             continue
-        pos = file_map.get(line_int)
-        if pos is None:
+        if line_int not in file_map:
             dropped.append(f"{path}:{line_int} (line not in diff)")
             dropped_pairs.add((path, line_int))
             continue
@@ -390,6 +674,7 @@ def run_review(
                     PRCommentSnapshot.line == line_int,
                 )
             ).first()
+        comment_payload = {"path": path, "line": line_int, "side": "RIGHT", "body": body}
         if snap:
             try:
                 patch_pull_request_comment(owner, repo, snap.github_comment_id, body)
@@ -397,9 +682,13 @@ def run_review(
                 print(f"[github] patched comment {snap.github_comment_id} on {path}:{line_int}", flush=True)
             except requests.HTTPError as e:
                 print(f"[github] patch failed, will post new: {e}", flush=True)
-                inline.append({"path": path, "position": pos, "body": body})
+                inline.append(comment_payload)
         else:
-            inline.append({"path": path, "position": pos, "body": body})
+            inline.append(comment_payload)
+
+    inline = _merge_inline_by_line(reconcile_prefix, inline)
+    for c in reconcile_prefix:
+        flagged_pairs.add((c["path"], c["line"]))
 
     patched_set = set(patched_ids)
     for rid in raw_resolve_ids:
@@ -442,16 +731,42 @@ def run_review(
         resolved_threads=resolved_model + resolved_heuristic,
         general_notes=general_notes,
     )
+    gn_count = len([x for x in (general_notes or []) if str(x).strip()])
+    resolved_total = resolved_model + resolved_heuristic
 
     if not inline:
-        post_pr_comment(owner, repo, pr_number, summary)
-        print("[ok] posted summary comment (no new inline)", flush=True)
-        # Refresh snapshots from patches only — nothing new to store.
+        if _omit_summary_issue_comment(
+            skipped,
+            dropped,
+            patched_count=len(patched_ids),
+            resolved_threads=resolved_total,
+            general_notes=general_notes,
+        ):
+            print(
+                "[ok] skipping summary issue comment (only skipped/generated paths — no spam)",
+                flush=True,
+            )
+        else:
+            post_pr_comment(owner, repo, pr_number, summary)
+            print("[ok] posted summary comment (no new inline)", flush=True)
+        _finalize_review_run(
+            session,
+            review_run_id,
+            status="completed",
+            inline_posted=0,
+            patched_count=len(patched_ids),
+            resolved_threads=resolved_total,
+            general_notes_count=gn_count,
+            skipped_files_count=len(skipped),
+            dropped_invalid_count=len(dropped),
+            used_fallback_comment=False,
+        )
         return
 
     try:
         posted = post_pr_review(owner, repo, pr_number, head_sha, summary, inline)
         print(f"[ok] review posted: {posted.get('html_url')}", flush=True)
+        delete_obsolete_fallback_issue_comments(owner, repo, pr_number)
         review_id = posted.get("id")
         if session is not None and review_id is not None:
             _refresh_comment_snapshots(
@@ -463,6 +778,18 @@ def run_review(
                 int(review_id),
                 expected_inline=len(inline),
             )
+        _finalize_review_run(
+            session,
+            review_run_id,
+            status="completed",
+            inline_posted=len(inline),
+            patched_count=len(patched_ids),
+            resolved_threads=resolved_total,
+            general_notes_count=gn_count,
+            skipped_files_count=len(skipped),
+            dropped_invalid_count=len(dropped),
+            used_fallback_comment=False,
+        )
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
             print(
@@ -472,10 +799,30 @@ def run_review(
             )
             body_lines = [summary, ""]
             for c in inline:
-                body_lines.append(f"**`{c['path']}` (position {c['position']})**")
+                ln = c.get("line", "?")
+                body_lines.append(f"**`{c['path']}` (line {ln})**")
                 body_lines.append(c["body"])
                 body_lines.append("")
-            post_pr_comment(owner, repo, pr_number, "\n".join(body_lines))
+            created = post_pr_comment(owner, repo, pr_number, "\n".join(body_lines))
+            new_id = created.get("id") if isinstance(created, dict) else None
+            delete_obsolete_fallback_issue_comments(
+                owner,
+                repo,
+                pr_number,
+                except_comment_id=int(new_id) if new_id is not None else None,
+            )
+            _finalize_review_run(
+                session,
+                review_run_id,
+                status="completed",
+                inline_posted=len(inline),
+                patched_count=len(patched_ids),
+                resolved_threads=resolved_total,
+                general_notes_count=gn_count,
+                skipped_files_count=len(skipped),
+                dropped_invalid_count=len(dropped),
+                used_fallback_comment=True,
+            )
         else:
             raise
 
@@ -708,8 +1055,17 @@ def _build_summary(
         parts.append(f"🤖 Found {len(inline)} thing(s) worth a look.")
     elif not patched_count and not inline:
         if not resolved_threads:
-            parts.append("🤖 Reviewed — nothing to flag.")
-    body = " ".join(parts) if parts else "🤖 Reviewed — nothing to flag."
+            if skipped:
+                parts.append(
+                    "🤖 No new findings on reviewable lines (skipped paths are listed below)."
+                )
+            else:
+                parts.append("🤖 Reviewed — nothing to flag.")
+    body = " ".join(parts) if parts else (
+        "🤖 No new findings on reviewable lines (skipped paths are listed below)."
+        if skipped
+        else "🤖 Reviewed — nothing to flag."
+    )
     gn = [x for x in (general_notes or []) if str(x).strip()]
     if gn:
         body += "\n\n**Layout / repo notes** (no diff anchor)\n"
@@ -726,6 +1082,12 @@ def _build_summary(
         notes.append(f"{len(dropped)} suggestion(s) dropped (referenced lines not in diff).")
     if notes:
         body += "\n\n_" + " ".join(notes) + "_"
+    if skipped and _skipped_paths_suggest_gitignore(skipped):
+        body += (
+            "\n\n_Generated or dependency paths such as `__pycache__/` usually should "
+            "not be committed — add them to `.gitignore` and remove them from the repo "
+            "when possible._"
+        )
     return body
 
 

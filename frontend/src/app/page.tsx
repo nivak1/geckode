@@ -1,6 +1,13 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { GitPullRequestArrow, MessageSquareCode, ShieldCheck, Sparkles } from "lucide-react";
+import {
+  GitPullRequestArrow,
+  Link2,
+  MessageSquare,
+  MessageSquareCode,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
 
 import { auth } from "@/lib/auth";
 import { GeckodeLogo } from "@/components/geckode-logo";
@@ -31,10 +38,10 @@ export default async function LandingPage() {
       </header>
 
       <main className="container">
-        <section className="mx-auto flex max-w-3xl flex-col items-center pb-24 pt-20 text-center sm:pt-28">
-          <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border/70 bg-card/40 px-3 py-1 text-xs text-muted-foreground backdrop-blur">
-            <Sparkles className="h-3.5 w-3.5 text-primary" />
-            AI code reviews, configured per repo
+        <section className="mx-auto flex max-w-3xl flex-col items-center pb-16 pt-20 text-center sm:pt-28">
+          <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border/70 bg-card/40 px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground backdrop-blur">
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-primary" />
+            Security · Performance · Maintainability
           </div>
           <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
             Code reviews that actually
@@ -44,9 +51,9 @@ export default async function LandingPage() {
             .
           </h1>
           <p className="mt-6 max-w-2xl text-balance text-lg text-muted-foreground">
-            Geckode reviews every pull request against your team&apos;s standards,
-            language, and strictness. Connect a repo with one click — no
-            webhooks, no YAML, no <code className="rounded bg-card px-1.5 py-0.5 text-sm">/review</code> commands to memorize.
+            Geckode runs a multi-lens AI council on every pull request — surfacing
+            security risks, performance issues, and maintainability problems before
+            merge. Connect a repository in seconds.
           </p>
           <div className="mt-10 flex flex-col items-center gap-3 sm:flex-row">
             <SignInButton callbackUrl="/dashboard" />
@@ -55,12 +62,44 @@ export default async function LandingPage() {
             </Button>
           </div>
           <p className="mt-4 text-xs text-muted-foreground">
-            Free for personal repos. We never store your source — only review
-            settings.
+            We don&apos;t store your source — only review preferences and repo
+            settings you configure in Geckode.
           </p>
         </section>
 
-        <section id="features" className="mx-auto grid max-w-5xl gap-4 pb-24 sm:grid-cols-3">
+        <section
+          aria-labelledby="how-heading"
+          className="mx-auto max-w-5xl border-y border-border/60 bg-card/25 px-4 py-14 backdrop-blur sm:px-6"
+        >
+          <h2
+            id="how-heading"
+            className="text-center text-sm font-semibold uppercase tracking-wide text-muted-foreground"
+          >
+            How it works
+          </h2>
+          <div className="mt-10 grid gap-10 sm:grid-cols-3 sm:gap-8">
+            <HowStep
+              step={1}
+              icon={<Link2 className="h-5 w-5" />}
+              title="Connect"
+              body="Sign in with GitHub and choose a repository. Geckode registers the webhook — no URLs to paste."
+            />
+            <HowStep
+              step={2}
+              icon={<Sparkles className="h-5 w-5" />}
+              title="Review"
+              body="Open a PR from the dashboard and run a review. The council reads your diff through security, performance, and maintainability lenses."
+            />
+            <HowStep
+              step={3}
+              icon={<MessageSquare className="h-5 w-5" />}
+              title="Feedback on GitHub"
+              body="Comments and summaries land on the pull request where your team already reviews code."
+            />
+          </div>
+        </section>
+
+        <section id="features" className="mx-auto grid max-w-5xl gap-4 pb-24 pt-16 sm:grid-cols-3">
           <FeatureCard
             icon={<GitPullRequestArrow className="h-5 w-5" />}
             title="One‑click connect"
@@ -85,6 +124,31 @@ export default async function LandingPage() {
           <span>Built with Next.js · Hosted on Vercel</span>
         </div>
       </footer>
+    </div>
+  );
+}
+
+function HowStep({
+  step,
+  icon,
+  title,
+  body,
+}: {
+  step: number;
+  icon: React.ReactNode;
+  title: string;
+  body: string;
+}) {
+  return (
+    <div className="flex flex-col items-center text-center sm:items-start sm:text-left">
+      <span className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-inset ring-primary/25">
+        {icon}
+      </span>
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        Step {step}
+      </span>
+      <h3 className="mt-1 text-base font-semibold">{title}</h3>
+      <p className="mt-2 text-sm text-muted-foreground">{body}</p>
     </div>
   );
 }

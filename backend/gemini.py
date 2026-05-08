@@ -446,3 +446,79 @@ def review_pr_council(
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
     return _parse_review_llm_result((syn_resp.text or "").strip())
+
+
+_FALLBACK_FIXED_PROMPT = """You judge whether each prior finding from an aggregate PR comment has been FULLY addressed in the CURRENT unified diff.
+
+Return ONE JSON object with exactly this shape:
+{{ "fixed": [ true or false, ... ] }}
+
+The array MUST have exactly {n} booleans in the same order as the items below.
+
+Rules:
+- TRUE only if the current diff clearly shows the issue is resolved (corrected code, removed bad pattern, or the finding is obsolete).
+- FALSE if the issue likely remains, you are unsure, or the relevant lines are unchanged.
+
+## Commit summary (context)
+{commits}
+
+## Items (same order as output booleans)
+{items_block}
+
+## Unified diff
+{diff}
+
+Respond with ONLY the JSON object. No markdown fences.
+"""
+
+
+def classify_fallback_items_fixed(
+    filtered_diff: str,
+    items: list[dict],
+    *,
+    commits_text: str = "",
+    max_diff_chars: int = 48_000,
+) -> list[bool] | None:
+    """Return whether each parsed fallback item is fixed; None if the model call failed."""
+    if not items:
+        return []
+    n = len(items)
+    lines: list[str] = []
+    for i, it in enumerate(items):
+        excerpt = ((it.get("body") or "").replace("\r\n", "\n"))[:400].replace("\n", " ")
+        ln = it.get("line")
+        lines.append(f'{i}. `{it.get("path")}` line {ln} — {excerpt}')
+    items_block = "\n".join(lines)
+    diff_txt = filtered_diff if len(filtered_diff) <= max_diff_chars else (
+        filtered_diff[: max_diff_chars // 2]
+        + "\n\n[...diff truncated for classify step...]\n\n"
+        + filtered_diff[-max_diff_chars // 2 :]
+    )
+    prompt = _FALLBACK_FIXED_PROMPT.format(
+        n=n,
+        commits=commits_text or "(none)",
+        items_block=items_block,
+        diff=diff_txt,
+    )
+    try:
+        client = _get_client()
+        resp = client.models.generate_content(
+            model=_fast_model(),
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        raw = (resp.text or "").strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        fixed_raw = data.get("fixed")
+        if not isinstance(fixed_raw, list):
+            return None
+        out: list[bool] = []
+        for x in fixed_raw[:n]:
+            out.append(bool(x))
+        while len(out) < n:
+            out.append(False)
+        return out[:n]
+    except Exception:
+        return None
