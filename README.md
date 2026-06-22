@@ -45,6 +45,24 @@ A single AI "review this PR" prompt is shallow: it skims the diff and misses wha
                      reconciled back to inline comments on a later review
 ```
 
+```mermaid
+flowchart TD
+    A["/review comment"] --> W[webhook]
+    B[dashboard button] --> W
+    W --> V[HMAC-SHA256 verify] --> D[dedupe delivery] --> J[background job]
+    J --> F[fetch PR diff + commits + tree]
+    F --> M[filter to budget + build diff-position map]
+    M --> S1[security pass]
+    M --> S2[performance pass]
+    M --> S3[maintainability pass]
+    S1 --> SY[synthesis: merge + dedupe by file:line]
+    S2 --> SY
+    S3 --> SY
+    SY --> P[post inline review + PATCH prior comments + resolve fixed threads]
+    P -. "GitHub 422" .-> FB[fallback: one aggregate comment, reconciled later]
+```
+_The three specialist passes run concurrently (one `ThreadPoolExecutor`); synthesis waits on all of them._
+
 **Hand-rolled orchestration, no framework.** Specialist agents run concurrently via Python's `ThreadPoolExecutor`, each with its own role prompt over the same diff; a dedicated synthesis pass then resolves overlap and emits one structured-JSON review. Built from primitives so every step — prompt, model, budget, merge — is under direct control. The same "many specialists → one answer" council pattern generalizes well beyond code review.
 
 **Cost-aware model routing.** Geckode runs on Google Gemini, but selects the model *per pass*: a fast model for light passes, a stronger model when the diff is security-sensitive or large, and a separate model for synthesis — so spend tracks the work. The routing layer is provider-agnostic; enabling additional providers is a configuration change.
@@ -59,6 +77,14 @@ The interesting engineering is in the parts that separate a demo from a product:
 - **Security & privacy posture.** Source code and diffs are **never persisted** — only repo settings and comment metadata (path/line/id). OAuth tokens and webhook secrets are **encrypted at rest (Fernet)**; webhooks are verified with **HMAC-SHA256**; duplicate webhook deliveries are de-duped with bounded, amortized cleanup.
 - **Resilient GitHub access.** Posts as a bot token first, falls back to the connecting user's OAuth token on 403/404; thread resolution uses GraphQL (no REST equivalent).
 - **Budget guardrails throughout** — diff size, repo-tree appendix, and synthesis input are each capped to keep latency and token cost predictable.
+
+## Evaluation — how I'd measure "correct"
+
+Calling an AI reviewer "good" without defining correctness is hand-waving. Here's the eval model this is built toward, and what's actually in place:
+
+- **What correctness means here:** precision and recall of findings against PRs with known issues; a low false-positive rate (noise is what kills review bots); zero hallucinated line references; correct dedup (one comment per real issue) and correct resolution (only close threads the diff actually fixed).
+- **What's verified deterministically today:** the diff-position mapping and budget filtering are pure functions with unit tests — the "comment lands on the right line" correctness floor is covered, because a wrong map is the failure mode that silently posts garbage onto the wrong code.
+- **What a full eval harness would add (designed, not yet built — stated, not hidden):** a fixture set of PRs with annotated expected findings, scored each run for precision / recall / false-positive-rate per dimension; regression tracking when a prompt or model tier changes; and an LLM-as-judge pass grading comment usefulness against a rubric.
 
 ## Tech stack
 
