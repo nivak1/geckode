@@ -43,13 +43,14 @@ from github_api import (
     resolve_pull_request_review_thread,
 )
 from repo_tree import build_tree_appendix
-from models import PRCommentSnapshot, ConnectedRepo, ReviewRun, standards_from_json
+from models import PRCommentSnapshot, ConnectedRepo, ReviewRun, User, standards_from_json
 from review_dimensions import (
     DEFAULT_REVIEW_DIMENSIONS,
     merge_dimensions,
     parse_dimensions_json,
 )
 from review_instructions import parse_review_trigger
+from secrets_storage import decrypt_from_storage
 
 
 _FOLLOWUP_ONLY_TRIGGERS = (
@@ -83,12 +84,90 @@ def _augment_extra_instructions(extra: str | None) -> str:
     return (base + suffix).strip() if base else suffix.strip()
 
 
+def _resolve_repo_read_access_token(
+    session: Session | None, repo_full_name: str
+) -> str | None:
+    """OAuth token used for repo reads; falls back to bot token when unavailable."""
+    if session is None:
+        return None
+    repo_row = session.exec(
+        select(ConnectedRepo).where(ConnectedRepo.full_name == repo_full_name)
+    ).first()
+    if not repo_row:
+        return None
+    user = session.get(User, int(repo_row.user_id))
+    if not user:
+        return None
+    return decrypt_from_storage(user.access_token)
+
+
+def _is_repo_write_access_error(exc: requests.HTTPError) -> bool:
+    status = exc.response.status_code if exc.response is not None else None
+    return status in (403, 404)
+
+
+def _post_pr_comment_with_fallback(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str,
+    *,
+    read_access_token: str | None,
+) -> dict[str, object]:
+    """Post comment as bot token first; fallback to user OAuth token when bot lacks access."""
+    try:
+        return post_pr_comment(owner, repo, pr_number, body)
+    except requests.HTTPError as e:
+        if read_access_token and _is_repo_write_access_error(e):
+            print(
+                "[github] bot comment post denied (403/404) — retrying with user OAuth token",
+                flush=True,
+            )
+            return post_pr_comment(
+                owner, repo, pr_number, body, access_token=read_access_token
+            )
+        raise
+
+
+def _post_pr_review_with_fallback(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    commit_id: str,
+    summary: str,
+    inline_comments: list[dict],
+    *,
+    read_access_token: str | None,
+) -> dict[str, object]:
+    """Post review as bot token first; fallback to user OAuth token when bot lacks access."""
+    try:
+        return post_pr_review(owner, repo, pr_number, commit_id, summary, inline_comments)
+    except requests.HTTPError as e:
+        if read_access_token and _is_repo_write_access_error(e):
+            print(
+                "[github] bot review post denied (403/404) — retrying with user OAuth token",
+                flush=True,
+            )
+            return post_pr_review(
+                owner,
+                repo,
+                pr_number,
+                commit_id,
+                summary,
+                inline_comments,
+                access_token=read_access_token,
+            )
+        raise
+
+
 def sync_geckode_snapshots_from_github(
     owner: str,
     repo: str,
     pr_number: int,
     session: Session,
     repo_full_name: str,
+    *,
+    access_token: str | None = None,
 ) -> int:
     """Upsert PRCommentSnapshot rows from existing pull review comments by GITHUB_TOKEN's user.
 
@@ -114,7 +193,9 @@ def sync_geckode_snapshots_from_github(
         match_desc = f"token user {token_login!r}"
 
     try:
-        raw = list_pull_request_review_comments_all(owner, repo, pr_number)
+        raw = list_pull_request_review_comments_all(
+            owner, repo, pr_number, access_token=access_token
+        )
     except Exception as e:
         print(f"[github] snapshot import list comments: {e}", flush=True)
         return 0
@@ -213,6 +294,7 @@ def delete_obsolete_fallback_issue_comments(
     pr_number: int,
     *,
     except_comment_id: int | None = None,
+    access_token: str | None = None,
 ) -> None:
     """Remove Geckode 422 aggregate issue comments superseded by an inline review.
 
@@ -222,7 +304,7 @@ def delete_obsolete_fallback_issue_comments(
     if not allowed:
         return
     try:
-        comments = list_issue_comments(owner, repo, pr_number)
+        comments = list_issue_comments(owner, repo, pr_number, access_token=access_token)
     except Exception as e:
         print(f"[cleanup] list issue comments: {e}", flush=True)
         return
@@ -284,6 +366,8 @@ def _reconcile_fallback_issue_comments(
     filtered_diff: str,
     commits_text: str,
     positions: dict[str, dict[int, int]],
+    *,
+    access_token: str | None = None,
 ) -> list[dict]:
     """Detect Geckode 422 aggregate issue comments; delete when appropriate; return unfixed inlines."""
     allowed = _issue_comment_allowed_logins()
@@ -291,7 +375,7 @@ def _reconcile_fallback_issue_comments(
         return []
 
     try:
-        comments = list_issue_comments(owner, repo, pr_number)
+        comments = list_issue_comments(owner, repo, pr_number, access_token=access_token)
     except Exception as e:
         print(f"[reconcile] list issue comments: {e}", flush=True)
         return []
@@ -387,9 +471,11 @@ def _reconcile_fallback_issue_comments(
     return []
 
 
-def _build_tree_appendix_block(owner: str, repo: str, head_sha: str) -> str:
+def _build_tree_appendix_block(
+    owner: str, repo: str, head_sha: str, *, access_token: str | None = None
+) -> str:
     try:
-        paths = get_recursive_tree_paths(owner, repo, head_sha)
+        paths = get_recursive_tree_paths(owner, repo, head_sha, access_token=access_token)
         return build_tree_appendix(paths, max_chars=MAX_TREE_APPENDIX_CHARS)
     except Exception as e:
         print(f"[github] recursive tree: {e}", flush=True)
@@ -402,6 +488,8 @@ def _build_prior_threads_block(
     repo: str,
     repo_full_name: str,
     pr_number: int,
+    *,
+    access_token: str | None = None,
 ) -> tuple[str, set[int]]:
     """Markdown-ish lines for the LLM + valid GitHub comment ids for this PR."""
     if session is None:
@@ -422,7 +510,9 @@ def _build_prior_threads_block(
         valid_ids.add(int(snap.github_comment_id))
         snippet = ""
         try:
-            c = get_pull_request_review_comment(owner, repo, int(snap.github_comment_id))
+            c = get_pull_request_review_comment(
+                owner, repo, int(snap.github_comment_id), access_token=access_token
+            )
             body = (c.get("body") or "").strip().replace("\r\n", "\n")
             snippet = body[:PRIOR_COMMENT_SNIPPET_CHARS]
             if len(body) > PRIOR_COMMENT_SNIPPET_CHARS:
@@ -520,12 +610,20 @@ def run_review(
     review_dimensions_override: dict[str, str] | None = None,
     review_run_id: int | None = None,
 ) -> None:
-    commits = get_pr_commits(owner, repo, pr_number)
-    raw_diff = get_pr_diff(owner, repo, pr_number)
-    head_sha = get_pr_head_sha(owner, repo, pr_number)
+    full_name = f"{owner}/{repo}"
+    read_access_token = _resolve_repo_read_access_token(session, full_name)
+    commits = get_pr_commits(owner, repo, pr_number, access_token=read_access_token)
+    raw_diff = get_pr_diff(owner, repo, pr_number, access_token=read_access_token)
+    head_sha = get_pr_head_sha(owner, repo, pr_number, access_token=read_access_token)
 
     if not raw_diff.strip():
-        post_pr_comment(owner, repo, pr_number, "🤖 The diff is empty — nothing to review.")
+        _post_pr_comment_with_fallback(
+            owner,
+            repo,
+            pr_number,
+            "🤖 The diff is empty — nothing to review.",
+            read_access_token=read_access_token,
+        )
         _finalize_review_run(
             session,
             review_run_id,
@@ -540,10 +638,15 @@ def run_review(
         )
         return
 
-    yml_text = get_repo_file(owner, repo, ".reviewer.yml", ref=head_sha)
+    yml_text = get_repo_file(
+        owner,
+        repo,
+        ".reviewer.yml",
+        ref=head_sha,
+        access_token=read_access_token,
+    )
     repo_config = load_merged_repo_config(session, owner, repo, head_sha, yml_text)
 
-    full_name = f"{owner}/{repo}"
     dimensions = dict(DEFAULT_REVIEW_DIMENSIONS)
     if session is not None:
         crow = session.exec(
@@ -555,11 +658,12 @@ def run_review(
 
     filtered_diff, skipped = filter_diff(raw_diff, MAX_DIFF_CHARS)
     if not filtered_diff.strip():
-        post_pr_comment(
+        _post_pr_comment_with_fallback(
             owner,
             repo,
             pr_number,
             "🤖 Nothing to review — all changed files are generated/vendored or excluded.",
+            read_access_token=read_access_token,
         )
         _finalize_review_run(
             session,
@@ -583,12 +687,13 @@ def run_review(
     positions = build_position_map(raw_diff)
 
     if all(dimensions[k] == "off" for k in ("security", "performance", "maintainability")):
-        post_pr_comment(
+        _post_pr_comment_with_fallback(
             owner,
             repo,
             pr_number,
             "🤖 Review skipped — all council dimensions are set to \"Don't check\". "
             "Enable Security, Performance, or Maintainability in repo settings or the review dialog.",
+            read_access_token=read_access_token,
         )
         _finalize_review_run(
             session,
@@ -605,17 +710,37 @@ def run_review(
         return
 
     if session is not None:
-        sync_geckode_snapshots_from_github(owner, repo, pr_number, session, full_name)
+        sync_geckode_snapshots_from_github(
+            owner,
+            repo,
+            pr_number,
+            session,
+            full_name,
+            access_token=read_access_token,
+        )
 
     commits_text = format_commits(commits)
     reconcile_prefix = _reconcile_fallback_issue_comments(
-        owner, repo, pr_number, filtered_diff, commits_text, positions
+        owner,
+        repo,
+        pr_number,
+        filtered_diff,
+        commits_text,
+        positions,
+        access_token=read_access_token,
     )
 
     print(f"[gemini] asking {len(filtered_diff)} chars...", flush=True)
-    tree_block = _build_tree_appendix_block(owner, repo, head_sha)
+    tree_block = _build_tree_appendix_block(
+        owner, repo, head_sha, access_token=read_access_token
+    )
     prior_block, valid_prior_ids = _build_prior_threads_block(
-        session, owner, repo, full_name, pr_number
+        session,
+        owner,
+        repo,
+        full_name,
+        pr_number,
+        access_token=read_access_token,
     )
     llm = review_pr(
         commits_text,
@@ -712,6 +837,7 @@ def run_review(
         full_name,
         filtered_resolve_ids,
         extra_valid_ids=valid_prior_ids,
+        access_token=read_access_token,
     )
     resolved_heuristic = _resolve_cleared_review_threads_heuristic(
         session,
@@ -721,6 +847,7 @@ def run_review(
         full_name,
         flagged_pairs,
         dropped_pairs,
+        access_token=read_access_token,
     )
 
     summary = _build_summary(
@@ -747,7 +874,9 @@ def run_review(
                 flush=True,
             )
         else:
-            post_pr_comment(owner, repo, pr_number, summary)
+            _post_pr_comment_with_fallback(
+                owner, repo, pr_number, summary, read_access_token=read_access_token
+            )
             print("[ok] posted summary comment (no new inline)", flush=True)
         _finalize_review_run(
             session,
@@ -764,9 +893,19 @@ def run_review(
         return
 
     try:
-        posted = post_pr_review(owner, repo, pr_number, head_sha, summary, inline)
+        posted = _post_pr_review_with_fallback(
+            owner,
+            repo,
+            pr_number,
+            head_sha,
+            summary,
+            inline,
+            read_access_token=read_access_token,
+        )
         print(f"[ok] review posted: {posted.get('html_url')}", flush=True)
-        delete_obsolete_fallback_issue_comments(owner, repo, pr_number)
+        delete_obsolete_fallback_issue_comments(
+            owner, repo, pr_number, access_token=read_access_token
+        )
         review_id = posted.get("id")
         if session is not None and review_id is not None:
             _refresh_comment_snapshots(
@@ -777,6 +916,7 @@ def run_review(
                 full_name,
                 int(review_id),
                 expected_inline=len(inline),
+                access_token=read_access_token,
             )
         _finalize_review_run(
             session,
@@ -803,13 +943,20 @@ def run_review(
                 body_lines.append(f"**`{c['path']}` (line {ln})**")
                 body_lines.append(c["body"])
                 body_lines.append("")
-            created = post_pr_comment(owner, repo, pr_number, "\n".join(body_lines))
+            created = _post_pr_comment_with_fallback(
+                owner,
+                repo,
+                pr_number,
+                "\n".join(body_lines),
+                read_access_token=read_access_token,
+            )
             new_id = created.get("id") if isinstance(created, dict) else None
             delete_obsolete_fallback_issue_comments(
                 owner,
                 repo,
                 pr_number,
                 except_comment_id=int(new_id) if new_id is not None else None,
+                access_token=read_access_token,
             )
             _finalize_review_run(
                 session,
@@ -836,6 +983,7 @@ def _resolve_threads_by_comment_ids(
     comment_ids: list[int],
     *,
     extra_valid_ids: set[int],
+    access_token: str | None = None,
 ) -> int:
     """Resolve threads the model listed in resolve_comment_ids (validated)."""
     if session is None or not comment_ids:
@@ -843,7 +991,9 @@ def _resolve_threads_by_comment_ids(
     seen_req: set[int] = set()
     resolved = 0
     try:
-        cmap = map_pull_comment_ids_to_thread_ids(owner, repo, pr_number)
+        cmap = map_pull_comment_ids_to_thread_ids(
+            owner, repo, pr_number, access_token=access_token
+        )
     except Exception as e:
         print(f"[github] review thread map (graphql): {e}", flush=True)
         return 0
@@ -896,6 +1046,8 @@ def _resolve_cleared_review_threads_heuristic(
     repo_full_name: str,
     flagged_pairs: set[tuple[str, int]],
     dropped_pairs: set[tuple[str, int]],
+    *,
+    access_token: str | None = None,
 ) -> int:
     """Fallback: resolve when (path,line) no longer flagged and not ambiguously dropped."""
     if session is None:
@@ -926,7 +1078,9 @@ def _resolve_cleared_review_threads_heuristic(
     if not to_resolve:
         return 0
     try:
-        cmap = map_pull_comment_ids_to_thread_ids(owner, repo, pr_number)
+        cmap = map_pull_comment_ids_to_thread_ids(
+            owner, repo, pr_number, access_token=access_token
+        )
     except Exception as e:
         print(f"[github] heuristic thread map (graphql): {e}", flush=True)
         return 0
@@ -970,6 +1124,7 @@ def _refresh_comment_snapshots(
     review_id: int,
     *,
     expected_inline: int = 0,
+    access_token: str | None = None,
 ) -> None:
     """Store path+line → comment id so future reviews can PATCH.
 
@@ -980,7 +1135,7 @@ def _refresh_comment_snapshots(
     comments: list[dict] = []
     for attempt in range(12):
         comments = list_pull_comments_for_review_merged(
-            owner, repo, pr_number, review_id
+            owner, repo, pr_number, review_id, access_token=access_token
         )
         if comments or attempt >= 11:
             break
