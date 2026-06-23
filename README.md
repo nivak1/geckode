@@ -91,7 +91,7 @@ Calling an AI reviewer "good" without defining correctness is hand-waving. Here'
 | Layer | Tech |
 |-------|------|
 | Frontend | Next.js 14 (App Router) · TypeScript · Tailwind · shadcn/ui (Radix) · NextAuth — deployed on Vercel |
-| Backend | FastAPI · SQLModel · `google-genai` · `cryptography` (Fernet) — containerized with Docker |
+| Backend | FastAPI · SQLModel · `google-genai` · `cryptography` (Fernet) — containerized with Docker, deployed on AWS Elastic Beanstalk |
 | Data | PostgreSQL in production (SQLite for local dev) |
 | Integrations | GitHub OAuth · webhooks · REST + GraphQL · Gemini API |
 
